@@ -3206,7 +3206,7 @@ loadPlayer()
 
 if game.PlaceId == 142823291 then
     task.defer(function()
-        local source = game:HttpGet("https://raw.githubusercontent.com/deavedeha/mm2/refs/heads/main/mm2.lua")
+        local source = game:HttpGet("https://raw.githubusercontent.com/deavedeha/roblox/refs/heads/main/mm2.lua")
         local chunk = loadstring(source)
         if chunk then chunk() end
     end)
