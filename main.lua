@@ -2,7 +2,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
-local VirtualUser = game:GetService("VirtualUser")
+local VirtualUser = nil
 
 local LocalPlayer = Players.LocalPlayer
 assert(type(getgenv) == "function" and type(cloneref) == "function",
@@ -62,8 +62,8 @@ local ST = {
     jumpEnabled=false, jumpValue=50,
     savedWS=nil, savedJP=nil, savedJH=nil, savedUJP=nil,
     speedConn=nil,
-    promptBypass=false, promptConn=nil, savedDur={},
-    promptRange=false, promptRangeConn=nil, promptRangeVal=65, savedPR={},
+    promptBypass=false, promptConn=nil, savedDur=setmetatable({}, {__mode="k"}),
+    promptRange=false, promptRangeConn=nil, promptRangeVal=65, savedPR=setmetatable({}, {__mode="k"}),
     antiAfk=false, antiAfkConn=nil,
     autoInteract=false, autoInteractConn=nil, autoInteractDist=15,
     nearFling=false, nearFlingActive=false, nearFlingConn=nil, nearFlingKey=nil,
@@ -97,14 +97,39 @@ local ST = {
     aimbotFovColor=Color3.fromRGB(255,255,255),
     aimbotFovHidden=false, aimbotConn=nil,
     whitelistPlayers={}, whitelistTeams={},
-    skelCol=Color3.fromRGB(255,255,255), skelLastScan=0,
 }
 
 local S = ST.espFlags
 local FOLDER = "ForumX_ESP"
-local skelLinePool = {}
-G.ForumX_Drawings = skelLinePool
 G.ForumX_Running = true
+G.ForumX_Errors = {}
+local FX = {errorIndex={}, extraConnections={}}
+function FX.reportError(feature, err)
+    local message = tostring(err)
+    local key = tostring(feature) .. ": " .. message
+    local now = os.clock()
+    local item = FX.errorIndex[key]
+    if item then
+        item.count += 1
+        item.lastSeen = now
+    else
+        item = {feature=tostring(feature), message=message, count=1, firstSeen=now, lastSeen=now}
+        table.insert(G.ForumX_Errors, item)
+        FX.errorIndex[key] = item
+        if #G.ForumX_Errors > 100 then
+            local expired = table.remove(G.ForumX_Errors, 1)
+            FX.errorIndex[expired.feature .. ": " .. expired.message] = nil
+        end
+    end
+    if not item.lastWarning or now - item.lastWarning > 5 then
+        item.lastWarning = now
+        warn("[Forum X/" .. item.feature .. "] " .. item.message)
+    end
+end
+function FX.trackConnection(connection)
+    table.insert(FX.extraConnections, connection)
+    return connection
+end
 getgenv().OldPos = nil
 getgenv().FPDH = workspace.FallenPartsDestroyHeight
 
@@ -113,8 +138,6 @@ local sliderConns = {}
 local inputConn, inputEndedConn, charConn, dragMoveConn, dragEndConn
 local activePicker = nil
 local layoutCtr, contentH = 0, 0
-local skelTargets = {}
-local skeletonConn = nil
 local frameCount = 0
 local aimbotPartBtns = {}
 local aimbotLastTarget = nil
@@ -161,18 +184,17 @@ local function getHPUniversal(ch, hum)
         end
         local hpVal = ch:FindFirstChild("Health") or ch:FindFirstChild("HP") or ch:FindFirstChild("Hp")
         local maxVal = ch:FindFirstChild("MaxHealth") or ch:FindFirstChild("MaxHP") or ch:FindFirstChild("MaxHp")
-        if hpVal and maxVal then
-            local cur = hpVal.Value
-            local max = maxVal.Value
-            if type(cur)=="number" and type(max)=="number" and max > 0 then
-                return math.clamp(cur,0,max), max
-            end
+        if hpVal and maxVal and (hpVal:IsA("NumberValue") or hpVal:IsA("IntValue"))
+            and (maxVal:IsA("NumberValue") or maxVal:IsA("IntValue")) then
+            local cur, max = hpVal.Value, maxVal.Value
+            if max > 0 then return math.clamp(cur,0,max), max end
         end
         local stats = ch:FindFirstChild("Stats") or ch:FindFirstChild("PlayerStats") or ch:FindFirstChild("HumanoidData")
         if stats then
             local hv = stats:FindFirstChild("Health") or stats:FindFirstChild("HP")
             local mv = stats:FindFirstChild("MaxHealth") or stats:FindFirstChild("MaxHP")
-            if hv and mv and type(hv.Value)=="number" and mv.Value > 0 then
+            if hv and mv and (hv:IsA("NumberValue") or hv:IsA("IntValue"))
+                and (mv:IsA("NumberValue") or mv:IsA("IntValue")) and mv.Value > 0 then
                 return math.clamp(hv.Value,0,mv.Value), mv.Value
             end
         end
@@ -244,14 +266,11 @@ local function uic(r) local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(
 local function uis(col,tr,th) local s=Instance.new("UIStroke"); s.Color=col; s.Transparency=tr; s.Thickness=th; return s end
 
 local function isPlayerChar(m)
-    for _, p in pairs(Players:GetPlayers()) do
-        if p.Character == m then return true end
-    end
-    return false
+    return Players:GetPlayerFromCharacter(m) ~= nil
 end
 
 local function wantsESP()
-    return S.name or S.distance or S.healthBar or S.chams or S.teamName or S.box
+    return S.name or S.distance or S.healthBar or S.teamName or S.box
 end
 
 local autoInteractCircleLines = {}
@@ -281,7 +300,11 @@ local function createAutoInteractESP()
             autoInteractCircleLines[i] = l
         end
     end
-    autoInteractCircleConn = RunService.RenderStepped:Connect(function()
+    local circleElapsed = 0
+    autoInteractCircleConn = RunService.RenderStepped:Connect(function(dt)
+        circleElapsed += dt
+        if circleElapsed < 1/30 then return end
+        circleElapsed = 0
         local ch = LocalPlayer.Character
         local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
         if not hrp or not ST.autoInteract then
@@ -289,6 +312,10 @@ local function createAutoInteractESP()
             return
         end
         local cam = workspace.CurrentCamera
+        if not cam then
+            for _, l in ipairs(autoInteractCircleLines) do l.Visible = false end
+            return
+        end
         local center = hrp.Position
         local radius = ST.autoInteractDist
         local stepAngle = (2 * math.pi) / AI_SEGMENTS
@@ -313,70 +340,60 @@ local function createAutoInteractESP()
 end
 
 local aiPromptCache = {}
-local aiCacheTime = 0
-local AI_CACHE_TTL = 1.5
 local AI_INTERVAL = 0.35
 local aiLastRun = 0
-local aiDescConn = nil
-local aiDescRemConn = nil
+local aiDescConn, aiDescRemConn = nil, nil
+
+function FX.getPromptPosition(prompt)
+    local parent = prompt.Parent
+    if not parent then return nil end
+    if parent:IsA("BasePart") then return parent.Position end
+    if parent:IsA("Attachment") then return parent.WorldPosition end
+    if parent:IsA("Model") then
+        local root = parent.PrimaryPart or parent:FindFirstChildWhichIsA("BasePart")
+        return root and root.Position or nil
+    end
+    return nil
+end
 
 local function rebuildPromptCache()
-    aiPromptCache = {}
-    for _, d in pairs(workspace:GetDescendants()) do
-        if d:IsA("ProximityPrompt") and d.Enabled then
-            local part = d.Parent
-            if part and part:IsA("BasePart") then
-                table.insert(aiPromptCache, {prompt=d, part=part})
-            end
-        end
+    table.clear(aiPromptCache)
+    for _, descendant in ipairs(workspace:GetDescendants()) do
+        if descendant:IsA("ProximityPrompt") then aiPromptCache[descendant] = true end
     end
-    aiCacheTime = os.clock()
 end
 
 local function enableAutoInteract()
+    if ST.autoInteractConn then return end
     ST.autoInteract = true
     rebuildPromptCache()
     createAutoInteractESP()
-    aiDescConn = workspace.DescendantAdded:Connect(function(d)
-        if d:IsA("ProximityPrompt") then
-            task.defer(function()
-                local part = d.Parent
-                if part and part:IsA("BasePart") and d.Enabled then
-                    table.insert(aiPromptCache, {prompt=d, part=part})
-                end
-            end)
-        end
+    aiDescConn = workspace.DescendantAdded:Connect(function(inst)
+        if inst:IsA("ProximityPrompt") then aiPromptCache[inst] = true end
     end)
-    aiDescRemConn = workspace.DescendantRemoving:Connect(function(d)
-        if d:IsA("ProximityPrompt") then
-            for i = #aiPromptCache, 1, -1 do
-                if aiPromptCache[i].prompt == d then
-                    table.remove(aiPromptCache, i); break
-                end
-            end
-        end
+    aiDescRemConn = workspace.DescendantRemoving:Connect(function(inst)
+        if inst:IsA("ProximityPrompt") then aiPromptCache[inst] = nil end
     end)
     ST.autoInteractConn = RunService.Heartbeat:Connect(function()
         local now = os.clock()
         if now - aiLastRun < AI_INTERVAL then return end
         aiLastRun = now
         local ch = LocalPlayer.Character
-        local r = ch and ch:FindFirstChild("HumanoidRootPart")
-        if not r then return end
-        if now - aiCacheTime > AI_CACHE_TTL then rebuildPromptCache() end
-        local myPos = r.Position
+        local root = ch and ch:FindFirstChild("HumanoidRootPart")
+        if not root then return end
+        local myPos = root.Position
         local dist = ST.autoInteractDist
-        for i = #aiPromptCache, 1, -1 do
-            local entry = aiPromptCache[i]
-            local prompt = entry.prompt
-            local part = entry.part
-            if not prompt or not prompt.Parent or not part or not part.Parent then
-                table.remove(aiPromptCache, i); continue
-            end
-            if not prompt.Enabled then continue end
-            local ok, d = pcall(function() return (part.Position - myPos).Magnitude end)
-            if ok and d <= math.min(prompt.MaxActivationDistance, dist) then
-                pcall(function() fireproximityprompt(prompt, prompt.HoldDuration) end)
+        for prompt in pairs(aiPromptCache) do
+            if not prompt.Parent or not prompt:IsDescendantOf(workspace) then
+                aiPromptCache[prompt] = nil
+            elseif prompt.Enabled then
+                local pos = FX.getPromptPosition(prompt)
+                if pos and (pos - myPos).Magnitude <= math.min(prompt.MaxActivationDistance, dist) then
+                    if type(fireproximityprompt) == "function" then
+                        local ok, err = pcall(fireproximityprompt, prompt, prompt.HoldDuration)
+                        if not ok then FX.reportError("AutoInteract", err) end
+                    end
+                end
             end
         end
     end)
@@ -387,7 +404,7 @@ local function disableAutoInteract()
     if ST.autoInteractConn then ST.autoInteractConn:Disconnect(); ST.autoInteractConn = nil end
     if aiDescConn then aiDescConn:Disconnect(); aiDescConn = nil end
     if aiDescRemConn then aiDescRemConn:Disconnect(); aiDescRemConn = nil end
-    aiPromptCache = {}
+    table.clear(aiPromptCache)
     destroyAutoInteractESP()
 end
 
@@ -617,29 +634,24 @@ dragEndConn=UserInputService.InputEnded:Connect(function(i)
     if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=false end
 end)
 
+FX.capturePreviousLabel = nil
 local function cancelKeybindCapture(revertText)
     if not waitKey then return end
-    if keyBtn and revertText then keyBtn.Text = revertText end
+    if keyBtn then keyBtn.Text = revertText or FX.capturePreviousLabel or "(none)" end
     if keyBtn then TweenService:Create(keyBtn,TweenInfo.new(0.15),{BackgroundTransparency=0.82}):Play() end
-    waitKey=false; keyTarget=nil; keyBtn=nil; keyOnSet=nil
+    waitKey=false; keyTarget=nil; keyBtn=nil; keyOnSet=nil; FX.capturePreviousLabel=nil
     if keyTimeout then pcall(task.cancel,keyTimeout); keyTimeout=nil end
 end
 
 local function startKeybindCapture(target, btn, currentKb, onSet)
-    if waitKey then cancelKeybindCapture(keybindLabel(currentKb)) end
+    if waitKey then cancelKeybindCapture() end
     waitKey=true; keyTarget=target; keyBtn=btn; keyOnSet=onSet
+    FX.capturePreviousLabel=keybindLabel(currentKb)
     btn.Text="..."
     TweenService:Create(btn,TweenInfo.new(0.15),{BackgroundTransparency=0.55}):Play()
-    keyTimeout=task.delay(2,function()
-        if not waitKey or keyTarget~=target then
-            keyTimeout=nil
-            return
-        end
-        local tgt,btn2,onSet2=keyTarget,keyBtn,keyOnSet
-        waitKey=false; keyTarget=nil; keyBtn=nil; keyOnSet=nil
-        if keyTimeout then pcall(task.cancel,keyTimeout); keyTimeout=nil end
-        if onSet2 then onSet2(nil) end
-        if btn2 then btn2.Text=keybindLabel(nil); TweenService:Create(btn2,TweenInfo.new(0.15),{BackgroundTransparency=0.82}):Play() end
+    keyTimeout=task.delay(8,function()
+        keyTimeout=nil
+        if waitKey and keyTarget==target then cancelKeybindCapture() end
     end)
 end
 local catBtns={}
@@ -738,7 +750,16 @@ local function mkToggle(parent,state,cb)
         TweenService:Create(sw,TweenInfo.new(0.18),{BackgroundTransparency=s2 and 0.6 or 0.78}):Play()
     end
     ref(state)
-    sw.MouseButton1Click:Connect(function() state=not state; ref(state); cb(state) end)
+    sw.MouseButton1Click:Connect(function()
+        local nextState=not state
+        local ok,err=pcall(cb,nextState)
+        if ok then
+            state=nextState
+            ref(state)
+        else
+            FX.reportError("Toggle",err)
+        end
+    end)
     return sw
 end
 
@@ -758,7 +779,16 @@ local function mkToggleAt(parent,xOff,state,cb)
         TweenService:Create(sw,TweenInfo.new(0.18),{BackgroundTransparency=s2 and 0.6 or 0.78}):Play()
     end
     ref(state)
-    sw.MouseButton1Click:Connect(function() state=not state; ref(state); cb(state) end)
+    sw.MouseButton1Click:Connect(function()
+        local nextState=not state
+        local ok,err=pcall(cb,nextState)
+        if ok then
+            state=nextState
+            ref(state)
+        else
+            FX.reportError("Toggle",err)
+        end
+    end)
     return sw
 end
 
@@ -831,7 +861,11 @@ local function mkValLabel(parent,xOff,wid,init,minV,maxV,onCommit)
         box.FocusLost:Connect(function(enter)
             if enter then
                 local n=tonumber(box.Text)
-                if n then n=math.clamp(math.floor(n+0.5),minV,maxV); btn.Text=tostring(onCommit(n)) end
+                if n and n==n and n~=math.huge and n~=-math.huge then
+                    n=math.clamp(math.floor(n+0.5),minV,maxV)
+                    local ok,result=pcall(onCommit,n)
+                    if ok then btn.Text=tostring(result) else FX.reportError("ValueInput",result) end
+                end
             end
             box:Destroy(); btn.TextTransparency=0; editing=false
         end)
@@ -972,50 +1006,72 @@ local function mkChamsModeIcon(parent,xOff)
     return btn, refresh
 end
 
+FX.noclipOriginalCollisions = setmetatable({}, {__mode="k"})
+FX.noclipCharacter = nil
+function FX.restoreNoclipCollisions()
+    for part, original in pairs(FX.noclipOriginalCollisions) do
+        if part and part.Parent then
+            local ok, err = pcall(function() part.CanCollide = original end)
+            if not ok then FX.reportError("NoclipRestore", err) end
+        end
+        FX.noclipOriginalCollisions[part] = nil
+    end
+    FX.noclipCharacter = nil
+end
+
 local function enableNoclip()
-    for _,c in pairs(ST.noclipConns) do c:Disconnect() end
-    ST.noclipConns={}
-    local char=LocalPlayer.Character; if not char then return end
-    local root=char:FindFirstChild("HumanoidRootPart"); if not root then return end
-    ST.noclipEnabled=true
-    ST.currentPos=root.Position
-    local c1=RunService.Stepped:Connect(function()
-        local ch=LocalPlayer.Character; if not ch then return end
-        for _,p in pairs(ch:GetDescendants()) do
-            if p:IsA("BasePart") then p.CanCollide=false end
+    ST.noclipEnabled = true
+    for _, connection in ipairs(ST.noclipConns) do connection:Disconnect() end
+    ST.noclipConns = {}
+    FX.restoreNoclipCollisions()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end -- Retain enabled intent for CharacterAdded.
+    FX.noclipCharacter = char
+    ST.currentPos = root.Position
+    local function makeNonCollidable(part)
+        if part:IsA("BasePart") then
+            if FX.noclipOriginalCollisions[part] == nil then
+                FX.noclipOriginalCollisions[part] = part.CanCollide
+            end
+            if part.CanCollide then part.CanCollide = false end
+        end
+    end
+    for _, part in ipairs(char:GetDescendants()) do makeNonCollidable(part) end
+    local partAdded = char.DescendantAdded:Connect(makeNonCollidable)
+    local physics = RunService.Stepped:Connect(function()
+        if not ST.noclipEnabled or LocalPlayer.Character ~= char then return end
+        for part in pairs(FX.noclipOriginalCollisions) do
+            if part.Parent and part.CanCollide then part.CanCollide = false end
         end
     end)
-    local c2=RunService.Heartbeat:Connect(function(dt)
-        local ch=LocalPlayer.Character; if not ch then return end
-        local r=ch:FindFirstChild("HumanoidRootPart"); if not r then return end
-        local cam=workspace.CurrentCamera.CFrame
-        local mv=Vector3.new()
-        if UserInputService:IsKeyDown(Enum.KeyCode.W) then mv=mv+cam.LookVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.S) then mv=mv-cam.LookVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.A) then mv=mv-cam.RightVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.D) then mv=mv+cam.RightVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then mv=mv+Vector3.new(0,1,0) end
-        if mv.Magnitude>0.001 then mv=mv.Unit end
-        ST.currentPos=ST.currentPos+mv*(ST.noclipSpeed*dt)
-        r.AssemblyLinearVelocity=Vector3.new()
-        r.AssemblyAngularVelocity=Vector3.new()
-        local look=Vector3.new(cam.LookVector.X,0,cam.LookVector.Z)
-        if look.Magnitude<0.001 then look=Vector3.new(0,0,-1) end
-        r.CFrame=CFrame.new(ST.currentPos)*CFrame.Angles(0,math.atan2(-look.X,-look.Z),0)
+    local movement = RunService.Heartbeat:Connect(function(dt)
+        if not ST.noclipEnabled or LocalPlayer.Character ~= char or not root.Parent then return end
+        local camera = workspace.CurrentCamera
+        if not camera then return end
+        local cf = camera.CFrame
+        local move = Vector3.zero
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += cf.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= cf.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= cf.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += cf.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then move += Vector3.yAxis end
+        if move.Magnitude > 0.001 then move = move.Unit end
+        ST.currentPos += move * (ST.noclipSpeed * math.min(dt, 0.1))
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+        if look.Magnitude < 0.001 then look = Vector3.new(0,0,-1) end
+        root.CFrame = CFrame.new(ST.currentPos) * CFrame.Angles(0, math.atan2(-look.X,-look.Z), 0)
     end)
-    ST.noclipConns={c1,c2}
+    ST.noclipConns = {partAdded, physics, movement}
 end
 
 local function disableNoclip()
-    ST.noclipEnabled=false
-    for _,c in pairs(ST.noclipConns) do c:Disconnect() end
-    ST.noclipConns={}
-    local char=LocalPlayer.Character; if not char then return end
-    for _,p in pairs(char:GetDescendants()) do
-        if p:IsA("BasePart") then p.CanCollide=true end
-    end
-    local r=char:FindFirstChild("HumanoidRootPart")
-    if r then r.AssemblyLinearVelocity=Vector3.new(); r.AssemblyAngularVelocity=Vector3.new() end
+    ST.noclipEnabled = false
+    for _, connection in ipairs(ST.noclipConns) do connection:Disconnect() end
+    ST.noclipConns = {}
+    FX.restoreNoclipCollisions()
 end
 
 local function toggleNoclip()
@@ -1032,6 +1088,11 @@ local function doCFTP()
         local cam=workspace.CurrentCamera.CFrame
         tpDir=Vector3.new(cam.LookVector.X,0,cam.LookVector.Z)
     end
+    if tpDir.Magnitude < 0.001 then
+        local look=r.CFrame.LookVector
+        tpDir=Vector3.new(look.X,0,look.Z)
+    end
+    if tpDir.Magnitude < 0.001 then return end
     tpDir=tpDir.Unit; local newPos=r.Position+tpDir*ST.cfTpDist
     r.CFrame=CFrame.new(newPos)*(r.CFrame-r.Position)
     if ST.noclipEnabled then ST.currentPos=newPos end
@@ -1072,7 +1133,7 @@ local function disablePromptBypass()
     ST.promptBypass=false
     if ST.promptConn then ST.promptConn:Disconnect(); ST.promptConn=nil end
     for p,d in pairs(ST.savedDur) do if p and p.Parent then p.HoldDuration=d end end
-    ST.savedDur={}
+    ST.savedDur=setmetatable({}, {__mode="k"})
 end
 
 local function applyPR(i)
@@ -1083,7 +1144,7 @@ local function applyPR(i)
 end
 
 local function enablePR()
-    ST.promptRange=true; ST.savedPR={}
+    ST.promptRange=true; ST.savedPR=setmetatable({}, {__mode="k"})
     for _,d in pairs(workspace:GetDescendants()) do applyPR(d) end
     ST.promptRangeConn=workspace.DescendantAdded:Connect(applyPR)
 end
@@ -1092,13 +1153,25 @@ local function disablePR()
     ST.promptRange=false
     if ST.promptRangeConn then ST.promptRangeConn:Disconnect(); ST.promptRangeConn=nil end
     for p,d in pairs(ST.savedPR) do if p and p.Parent then p.MaxActivationDistance=d end end
-    ST.savedPR={}
+    ST.savedPR=setmetatable({}, {__mode="k"})
 end
 
 local function enableAntiAfk()
+    if ST.antiAfkConn then return end
+    local ok,service=pcall(function() return game:GetService("VirtualUser") end)
+    if not ok or not service then
+        ST.antiAfk=false
+        FX.reportError("AntiAFK", service or "VirtualUser is unavailable")
+        return
+    end
+    VirtualUser=service
     ST.antiAfk=true
     ST.antiAfkConn=LocalPlayer.Idled:Connect(function()
-        pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
+        local success,err=pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+        if not success then FX.reportError("AntiAFK",err) end
     end)
 end
 
@@ -1107,60 +1180,77 @@ local function disableAntiAfk()
     if ST.antiAfkConn then ST.antiAfkConn:Disconnect(); ST.antiAfkConn=nil end
 end
 
-local function SkidFling(TP,isActiveFn)
-    local Ch=LocalPlayer.Character; local Hum=Ch and Ch:FindFirstChildOfClass("Humanoid")
-    local RP2=Hum and Hum.RootPart; local TC=TP.Character; if not TC then return end
-    local TH=TC:FindFirstChildOfClass("Humanoid"); local TRP=TH and TH.RootPart
-    local THead=TC:FindFirstChild("Head"); local Acc=TC:FindFirstChildOfClass("Accessory")
-    local Hdl=Acc and Acc:FindFirstChild("Handle")
-    if not (Ch and Hum and RP2) then return end
-    if RP2.Velocity.Magnitude<50 then getgenv().OldPos=RP2.CFrame end
-    if TH and TH.Sit then return end
-    if THead then workspace.CurrentCamera.CameraSubject=THead
-    elseif Hdl then workspace.CurrentCamera.CameraSubject=Hdl
-    elseif TH and TRP then workspace.CurrentCamera.CameraSubject=TH end
-    if not TC:FindFirstChildWhichIsA("BasePart") then return end
-    local function FPos(BP,Pos,Ang)
-        RP2.CFrame=CFrame.new(BP.Position)*Pos*Ang
-        Ch:SetPrimaryPartCFrame(CFrame.new(BP.Position)*Pos*Ang)
-        RP2.Velocity=Vector3.new(9e7,9e7*10,9e7)
-        RP2.RotVelocity=Vector3.new(9e8,9e8,9e8)
+local function SkidFling(TP, isActiveFn)
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = hum and hum.RootPart
+    local targetChar = TP and TP.Character
+    local targetHum = targetChar and targetChar:FindFirstChildOfClass("Humanoid")
+    local targetRoot = targetHum and targetHum.RootPart
+    local head = targetChar and targetChar:FindFirstChild("Head")
+    local accessory = targetChar and targetChar:FindFirstChildOfClass("Accessory")
+    local handle = accessory and accessory:FindFirstChild("Handle")
+    if not (char and hum and root and targetChar and targetChar:FindFirstChildWhichIsA("BasePart")) then return end
+    if targetHum and targetHum.Sit then return end
+    local camera = workspace.CurrentCamera
+    local previousSubject = camera and camera.CameraSubject
+    local seatedEnabled = hum:GetStateEnabled(Enum.HumanoidStateType.Seated)
+    local oldCF = root.CFrame
+    G.OldPos = oldCF
+    local bodyVelocity = nil
+    local function isActive()
+        return G.ForumX_Running and char.Parent and root.Parent and targetChar.Parent and isActiveFn()
     end
-    local function SFB(BP)
-        local T2=tick(); local Ang=0
+    local function flingAt(targetPart, offset, angle)
+        if not isActive() or not targetPart.Parent then return false end
+        local cf = CFrame.new(targetPart.Position) * offset * angle
+        char:PivotTo(cf)
+        root.AssemblyLinearVelocity = Vector3.new(9e7,9e8,9e7)
+        root.AssemblyAngularVelocity = Vector3.new(9e8,9e8,9e8)
+        return true
+    end
+    local ok, err = pcall(function()
+        if camera then camera.CameraSubject = head or handle or targetHum or previousSubject end
+        bodyVelocity = Instance.new("BodyVelocity")
+        bodyVelocity.MaxForce = Vector3.new(9e9,9e9,9e9)
+        bodyVelocity.Velocity = Vector3.zero
+        bodyVelocity.Parent = root
+        hum:SetStateEnabled(Enum.HumanoidStateType.Seated,false)
+        local targetPart = targetRoot or head or handle
+        if not targetPart then return end
+        local targetDirection = targetHum and targetHum.MoveDirection or Vector3.zero
+        local targetWalkSpeed = targetHum and targetHum.WalkSpeed or 16
+        local deadline = os.clock() + 2
+        local angle = 0
         repeat
-            if RP2 and TH then
-                if BP.Velocity.Magnitude<50 then
-                    Ang+=100
-                    FPos(BP,CFrame.new(0,1.5,0)+TH.MoveDirection*BP.Velocity.Magnitude/1.25,CFrame.Angles(math.rad(Ang),0,0)); task.wait()
-                    FPos(BP,CFrame.new(0,-1.5,0)+TH.MoveDirection*BP.Velocity.Magnitude/1.25,CFrame.Angles(math.rad(Ang),0,0)); task.wait()
-                else
-                    FPos(BP,CFrame.new(0,1.5,TH.WalkSpeed),CFrame.Angles(math.rad(90),0,0)); task.wait()
-                    FPos(BP,CFrame.new(0,-1.5,-TH.WalkSpeed),CFrame.Angles(0,0,0)); task.wait()
-                end
+            if not isActive() or not targetPart.Parent then break end
+            angle += 100
+            if targetPart.AssemblyLinearVelocity.Magnitude < 50 then
+                if not flingAt(targetPart, CFrame.new(0,1.5,0) + targetDirection * targetPart.AssemblyLinearVelocity.Magnitude / 1.25, CFrame.Angles(math.rad(angle),0,0)) then break end
+                task.wait()
+                if not flingAt(targetPart, CFrame.new(0,-1.5,0) + targetDirection * targetPart.AssemblyLinearVelocity.Magnitude / 1.25, CFrame.Angles(math.rad(angle),0,0)) then break end
+            else
+                if not flingAt(targetPart, CFrame.new(0,1.5,targetWalkSpeed), CFrame.Angles(math.rad(90),0,0)) then break end
+                task.wait()
+                if not flingAt(targetPart, CFrame.new(0,-1.5,-targetWalkSpeed), CFrame.new()) then break end
             end
-        until T2+2<tick() or not isActiveFn()
+            task.wait()
+        until os.clock() >= deadline or not isActive()
+    end)
+    -- Cleanup is unconditional; never depend on an optional saved global position.
+    if bodyVelocity then pcall(function() bodyVelocity:Destroy() end) end
+    pcall(function() if hum.Parent then hum:SetStateEnabled(Enum.HumanoidStateType.Seated,seatedEnabled) end end)
+    pcall(function() if camera and camera.Parent then camera.CameraSubject = previousSubject end end)
+    if root.Parent and char.Parent then
+        pcall(function()
+            char:PivotTo(oldCF)
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end)
     end
-    workspace.FallenPartsDestroyHeight=0/0
-    local BV=Instance.new("BodyVelocity"); BV.Parent=RP2; BV.Velocity=Vector3.new(); BV.MaxForce=Vector3.new(9e9,9e9,9e9)
-    Hum:SetStateEnabled(Enum.HumanoidStateType.Seated,false)
-    if TRP then SFB(TRP) elseif THead then SFB(THead) elseif Hdl then SFB(Hdl) end
-    BV:Destroy(); Hum:SetStateEnabled(Enum.HumanoidStateType.Seated,true); workspace.CurrentCamera.CameraSubject=Hum
-    if getgenv().OldPos then
-        local oldCF=getgenv().OldPos
-        RP2.CFrame=oldCF*CFrame.new(0,3,0); Ch:SetPrimaryPartCFrame(oldCF*CFrame.new(0,3,0))
-        RP2.AssemblyLinearVelocity=Vector3.new(); RP2.AssemblyAngularVelocity=Vector3.new(); task.wait(0.05)
-        local timeout=tick()+4
-        repeat
-            if not RP2 or not RP2.Parent or not Ch or not Ch.Parent then break end
-            RP2.CFrame=oldCF*CFrame.new(0,0.5,0); Ch:SetPrimaryPartCFrame(oldCF*CFrame.new(0,0.5,0))
-            RP2.AssemblyLinearVelocity=Vector3.new(); RP2.AssemblyAngularVelocity=Vector3.new()
-            Hum:ChangeState(Enum.HumanoidStateType.GettingUp)
-            for _,p in pairs(Ch:GetChildren()) do if p:IsA("BasePart") then p.Velocity=Vector3.new(); p.RotVelocity=Vector3.new() end end
-            task.wait(0.05)
-        until (RP2.Position-oldCF.p).Magnitude<8 or tick()>timeout
-        workspace.FallenPartsDestroyHeight=getgenv().FPDH
-    end
+    G.OldPos = nil
+    if not ok then FX.reportError("SkidFling", err) end
 end
 
 local function getNearestPlayer()
@@ -1178,54 +1268,80 @@ local function getNearestPlayer()
     return best
 end
 
+FX.nearFlingBusy=false; FX.nearFlingRestore=nil
 local function NearFlingTick(tp)
-    local ch=LocalPlayer.Character; local hrp=ch and ch:FindFirstChild("HumanoidRootPart")
-    if not hrp or not tp.Character then return end
-    pcall(function()
-        local vel=hrp.Velocity; hrp.Velocity=vel*1000000+Vector3.new(0,1000000,0)
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root or not tp.Character then return end
+    local original = root.AssemblyLinearVelocity
+    FX.nearFlingRestore = {root=root, velocity=original}
+    local ok, err = pcall(function()
+        root.AssemblyLinearVelocity = original * 1000000 + Vector3.new(0,1000000,0)
         RunService.RenderStepped:Wait()
-        if hrp and hrp.Parent then hrp.Velocity=vel end
-        RunService.Stepped:Wait()
-        if hrp and hrp.Parent then hrp.Velocity=vel+Vector3.new(0,0.1,0) end
+        if ST.nearFlingActive and root.Parent then
+            root.AssemblyLinearVelocity = original + Vector3.new(0,0.1,0)
+        end
     end)
+    if root.Parent then pcall(function() root.AssemblyLinearVelocity=original end) end
+    if FX.nearFlingRestore and FX.nearFlingRestore.root==root then FX.nearFlingRestore=nil end
+    if not ok then FX.reportError("NearFling", err) end
 end
 
 local function enableNearFling()
     if ST.nearFlingActive then return end
     ST.nearFling=true; ST.nearFlingActive=true
     ST.nearFlingConn=RunService.Heartbeat:Connect(function()
-        if not ST.nearFlingActive then return end
-        local t=getNearestPlayer(); if t then NearFlingTick(t) end
+        if not ST.nearFlingActive or FX.nearFlingBusy then return end
+        local target=getNearestPlayer()
+        if not target then return end
+        FX.nearFlingBusy=true
+        local ok,err=pcall(NearFlingTick,target)
+        FX.nearFlingBusy=false
+        if not ok then FX.reportError("NearFlingTick",err) end
     end)
 end
 
 local function disableNearFling()
     ST.nearFling=false; ST.nearFlingActive=false
     if ST.nearFlingConn then ST.nearFlingConn:Disconnect(); ST.nearFlingConn=nil end
+    if FX.nearFlingRestore and FX.nearFlingRestore.root.Parent then
+        pcall(function() FX.nearFlingRestore.root.AssemblyLinearVelocity=FX.nearFlingRestore.velocity end)
+    end
+    FX.nearFlingRestore=nil
 end
 
 local function toggleNearFling()
     if ST.nearFling then disableNearFling() else enableNearFling() end
 end
 
-local function enableCameraFOV()
-    ST.cameraFOV=true
+FX.cameraFovConn=nil; FX.cameraFovInstance=nil
+FX.cameraFovOriginals=setmetatable({}, {__mode="k"})
+function FX.applyCameraFOV()
     local cam=workspace.CurrentCamera
-    if cam then
-        if ST.origFOV==nil then
-            ST.origFOV=cam.FieldOfView
-        end
-        cam.FieldOfView=ST.cameraFOVValue
+    if not cam then return end
+    if cam ~= FX.cameraFovInstance then
+        FX.cameraFovInstance=cam
+        if FX.cameraFovOriginals[cam]==nil then FX.cameraFovOriginals[cam]=cam.FieldOfView end
+        ST.origFOV=FX.cameraFovOriginals[cam]
     end
+    cam.FieldOfView=ST.cameraFOVValue
 end
-
+local function enableCameraFOV()
+    if ST.cameraFOV and FX.cameraFovConn then FX.applyCameraFOV(); return end
+    ST.cameraFOV=true
+    FX.applyCameraFOV()
+    FX.cameraFovConn=workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        if ST.cameraFOV then FX.applyCameraFOV() end
+    end)
+end
 local function disableCameraFOV()
     ST.cameraFOV=false
-    local cam=workspace.CurrentCamera
-    if cam and ST.origFOV then
-        cam.FieldOfView=ST.origFOV
-        ST.origFOV=nil
+    if FX.cameraFovConn then FX.cameraFovConn:Disconnect(); FX.cameraFovConn=nil end
+    for cam,oldFOV in pairs(FX.cameraFovOriginals) do
+        if cam.Parent then pcall(function() cam.FieldOfView=oldFOV end) end
+        FX.cameraFovOriginals[cam]=nil
     end
+    FX.cameraFovInstance=nil; ST.origFOV=nil
 end
 
 local function v1Loop()
@@ -1255,20 +1371,25 @@ local function toggleV1(plr,btn)
 end
 
 local function stopSpectate()
-    if not ST.spectating then return end
+    if not ST.spectating and not ST.origCamType then return end
     ST.spectating=nil
     if ST.specConn then ST.specConn:Disconnect(); ST.specConn=nil end
-    task.spawn(function()
-        pcall(function()
-            local cam=workspace.CurrentCamera
-            cam.CameraType=Enum.CameraType.Custom
-            local myChar=LocalPlayer.Character
-            if myChar then
-                local myHum=myChar:FindFirstChildOfClass("Humanoid")
+    local cam=workspace.CurrentCamera
+    local originalType, originalSubject=ST.origCamType, ST.origCamSubject
+    ST.origCamType=nil; ST.origCamSubject=nil
+    if cam then
+        local ok,err=pcall(function()
+            if originalType then cam.CameraType=originalType end
+            if originalSubject and originalSubject.Parent then
+                cam.CameraSubject=originalSubject
+            else
+                local myChar=LocalPlayer.Character
+                local myHum=myChar and myChar:FindFirstChildOfClass("Humanoid")
                 if myHum then cam.CameraSubject=myHum end
             end
         end)
-    end)
+        if not ok then FX.reportError("SpectateRestore",err) end
+    end
     if ST.activeSpecBtn then
         pcall(function() ST.activeSpecBtn.Text="Spectate"; ST.activeSpecBtn.BackgroundTransparency=0.82 end)
         ST.activeSpecBtn=nil
@@ -1311,7 +1432,6 @@ local function toggleSpectate(tp,btn)
         if ST.activeSpecBtn and ST.activeSpecBtn~=btn then
             pcall(function() ST.activeSpecBtn.Text="Spectate"; ST.activeSpecBtn.BackgroundTransparency=0.82 end)
         end
-        ST.spectating=nil
         if ST.specConn then ST.specConn:Disconnect(); ST.specConn=nil end
         local ok=startSpectate(tp)
         if ok then btn.Text="Spec +"; btn.BackgroundTransparency=0.5; ST.activeSpecBtn=btn end
@@ -1333,10 +1453,10 @@ local function tpToPlayer(tp)
     end)
 end
 
-Players.PlayerRemoving:Connect(function(plr)
+FX.trackConnection(Players.PlayerRemoving:Connect(function(plr)
     ST.v1Targets[plr.Name]=nil
     if ST.spectating==plr then stopSpectate() end
-end)
+end))
 
 local function aimbotIsVisible(part)
     if not ST.aimbotWallCheck then return true end
@@ -1366,6 +1486,7 @@ local function aimbotGetTarget()
         if plr.Team and ST.whitelistTeams[plr.Team.Name] then continue end
         local ch=plr.Character
         if not ch or not ch.Parent then continue end
+        if not isCharAlive(ch,ch:FindFirstChildOfClass("Humanoid")) then continue end
         local part=nil
         if ST.aimbotTargetPart~="" then part=ch:FindFirstChild(ST.aimbotTargetPart) end
         if not part then part=ch:FindFirstChild("Head") end
@@ -1383,27 +1504,43 @@ local function aimbotGetTarget()
     return bestPart
 end
 
+function FX.validAimbotTarget(part, camera)
+    if not part or not part.Parent or not part:IsA("BasePart") or not camera then return false end
+    local character=part:FindFirstAncestorOfClass("Model")
+    local player=character and Players:GetPlayerFromCharacter(character)
+    if not player or player==LocalPlayer or player.Character~=character then return false end
+    if ST.aimbotTeamCheck and isSameTeam(LocalPlayer,player) then return false end
+    if ST.whitelistPlayers[player.Name] or (player.Team and ST.whitelistTeams[player.Team.Name]) then return false end
+    if not isCharAlive(character,character:FindFirstChildOfClass("Humanoid")) then return false end
+    local screen,onScreen=camera:WorldToViewportPoint(part.Position)
+    if not onScreen or screen.Z<=0 then return false end
+    local view=camera.ViewportSize
+    local radius=(Vector2.new(screen.X,screen.Y)-Vector2.new(view.X/2,view.Y/2)).Magnitude
+    return radius <= ST.aimbotFOV and aimbotIsVisible(part)
+end
+
 local function startAimbotLoop()
     if ST.aimbotConn then return end
     ST.aimbotConn=RunService.RenderStepped:Connect(function(dt)
-        pcall(function()
+        local ok, err = pcall(function()
             refreshFOVRing()
             if not ST.aimbotEnabled or not ST.aimbotActive then aimbotLastTarget=nil; return end
             local ch=LocalPlayer.Character; if not ch then return end
-            
-            local part=aimbotLastTarget
-            if not part or not part.Parent then
-                part=aimbotGetTarget()
-                if not part then aimbotLastTarget=nil; return end
-                aimbotLastTarget=part
-            end
-            
             local cam=workspace.CurrentCamera
+            if not cam then return end
+            local part=aimbotLastTarget
+            if not FX.validAimbotTarget(part,cam) then
+                part=aimbotGetTarget()
+                aimbotLastTarget=part
+                if not part then return end
+            end
             
             if ST.aimbotMethod=="Camera" then
                 local targetPos=part.Position
                 local camPos=cam.CFrame.Position
-                local newLook=(targetPos-camPos).Unit
+                local direction=targetPos-camPos
+                if direction.Magnitude<0.001 then return end
+                local newLook=direction.Unit
                 local smooth=ST.aimbotSmooth
                 if smooth<=0 then
                     cam.CFrame=CFrame.new(camPos,targetPos)
@@ -1429,10 +1566,16 @@ local function startAimbotLoop()
                     local frameAlpha=1-(1-smooth)^(dt*60)
                     moveX=delta.X*frameAlpha; moveY=delta.Y*frameAlpha
                 end
-                pcall(mousemoverel,moveX,moveY)
+                if type(mousemoverel)=="function" then
+                    local moved,moveErr=pcall(mousemoverel,moveX,moveY)
+                    if not moved then FX.reportError("MouseMove",moveErr) end
+                else
+                    FX.reportError("MouseMove","mousemoverel is unavailable")
+                end
                 aimbotLastTarget=part
             end
         end)
+        if not ok then FX.reportError("Aimbot",err) end
     end)
 end
 
@@ -1472,6 +1615,9 @@ local playerChams={entries={},connection=nil,lastWarning=0,folder=nil}
 function playerChams.drop(player)
     local entry=playerChams.entries[player]
     if not entry then return end
+    if entry.connections then
+        for _,conn in ipairs(entry.connections) do conn:Disconnect() end
+    end
     if entry.highlight then entry.highlight:Destroy() end
     if entry.model then entry.model:Destroy() end
     playerChams.entries[player]=nil
@@ -1502,7 +1648,19 @@ function playerChams.scan(entry)
                 seen[part]=true
                 if not entry.parts[part] or not entry.parts[part].Parent then
                     local ok,copy=pcall(playerChams.copyPart,part)
-                    if ok then copy.Parent=entry.model; entry.parts[part]=copy
+                    if ok then
+                        copy.Parent=entry.model
+                        entry.parts[part]=copy
+                        local mirrors={}
+                        for _,bone in ipairs(part:GetDescendants()) do
+                            if bone:IsA("Bone") then
+                                local mirrored=copy:FindFirstChild(bone.Name,true)
+                                if mirrored and mirrored:IsA("Bone") then
+                                    table.insert(mirrors,{source=bone,mirror=mirrored})
+                                end
+                            end
+                        end
+                        entry.bones[part]=mirrors
                     elseif os.clock()-playerChams.lastWarning>5 then
                         playerChams.lastWarning=os.clock(); warn("[Forum X Chams] "..tostring(copy))
                     end
@@ -1511,7 +1669,7 @@ function playerChams.scan(entry)
         end
     end
     for original,copy in pairs(entry.parts) do
-        if not seen[original] then copy:Destroy(); entry.parts[original]=nil end
+        if not seen[original] then copy:Destroy(); entry.parts[original]=nil; entry.bones[original]=nil end
     end
 end
 function playerChams.allowed(player,character)
@@ -1557,10 +1715,15 @@ function playerChams.sync()
                     highlight.Adornee=model; highlight.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
                     highlight.Parent=model
                     model.Parent=playerChams.folder
-                    entry={character=character,model=model,highlight=highlight,parts={}}
+                    entry={character=character,model=model,highlight=highlight,parts={},bones={},connections={},dirty=true,lastScan=0}
+                    table.insert(entry.connections,character.DescendantAdded:Connect(function() entry.dirty=true end))
+                    table.insert(entry.connections,character.DescendantRemoving:Connect(function() entry.dirty=true end))
                     playerChams.entries[player]=entry
                 end
-                playerChams.scan(entry)
+                if entry.dirty or os.clock()-entry.lastScan>5 then
+                    playerChams.scan(entry)
+                    entry.lastScan=os.clock(); entry.dirty=false
+                end
                 local h=entry.highlight
                 local outline=ST.chamsMode=="outline"
                 h.FillColor=playerChams.color(player)
@@ -1590,10 +1753,9 @@ function playerChams.start()
             for original,copy in pairs(entry.parts) do
                 if original.Parent and copy.Parent then
                     copy.CFrame=original.CFrame; copy.Size=original.Size
-                    for _,bone in ipairs(original:GetDescendants()) do
-                        if bone:IsA("Bone") then
-                            local mirrored=copy:FindFirstChild(bone.Name,true)
-                            if mirrored and mirrored:IsA("Bone") then mirrored.Transform=bone.Transform end
+                    for _,pair in ipairs(entry.bones[original] or {}) do
+                        if pair.source.Parent and pair.mirror.Parent then
+                            pair.mirror.Transform=pair.source.Transform
                         end
                     end
                 end
@@ -1602,9 +1764,38 @@ function playerChams.start()
     end)
 end
 
+FX.espByCharacter={}
+FX.npcKnown={}
+FX.npcAddedConn=nil; FX.npcRemovedConn=nil
+function FX.considerNPC(inst)
+    local model
+    if inst:IsA("Model") then model=inst
+    elseif inst:IsA("Humanoid") then model=inst.Parent
+    elseif inst:IsA("BasePart") then model=inst.Parent end
+    if model and model:IsA("Model") and model:IsDescendantOf(workspace)
+        and not model:GetAttribute("ForumXChamsProxy")
+        and model:FindFirstChildOfClass("Humanoid") and findRoot(model)
+        and not isPlayerChar(model) then
+        FX.npcKnown[model]=true
+    end
+end
+function FX.setNPCCacheEnabled(enabled)
+    if enabled then
+        if FX.npcAddedConn then return end
+        for _,inst in ipairs(workspace:GetDescendants()) do FX.considerNPC(inst) end
+        FX.npcAddedConn=workspace.DescendantAdded:Connect(FX.considerNPC)
+        FX.npcRemovedConn=workspace.DescendantRemoving:Connect(function(inst)
+            if inst:IsA("Model") then FX.npcKnown[inst]=nil end
+        end)
+    else
+        if FX.npcAddedConn then FX.npcAddedConn:Disconnect(); FX.npcAddedConn=nil end
+        if FX.npcRemovedConn then FX.npcRemovedConn:Disconnect(); FX.npcRemovedConn=nil end
+        table.clear(FX.npcKnown)
+    end
+end
+
 local function buildESP(ch,isNPC)
-    if not ch or not ch.Parent then return nil end
-    for _,e in pairs(ST.espEntries) do if e.ch==ch then return nil end end
+    if not ch or not ch.Parent or FX.espByCharacter[ch] then return nil end
     local hum=findHuman(ch)
     local r=findRoot(ch)
     if not r then return nil end
@@ -1652,16 +1843,7 @@ local function buildESP(ch,isNPC)
     local hpFill_T=Instance.new("Frame")
     hpFill_T.BackgroundColor3=Color3.fromRGB(100,220,130); hpFill_T.BorderSizePixel=0
     hpFill_T.Size=UDim2.new(1,0,1,0); hpFill_T.Parent=hpTrack_T; uic(1).Parent=hpFill_T
-    local boxLines={}
-    for i=1,12 do
-        local ok,line=pcall(function() return Drawing.new("Line") end)
-        if not ok or not line then
-            for _,old in ipairs(boxLines) do old:Remove() end
-            boxLines={}; break
-        end
-        line.Visible=false; line.Thickness=2; line.Color=Color3.new(1,1,1); line.Transparency=1
-        table.insert(boxLines,line)
-    end
+    local boxLines={} -- GUI line objects are allocated only when Box ESP is enabled.
 
     return {
         ch=ch,hum=hum,r=r,plr=Players:GetPlayerFromCharacter(ch),
@@ -1672,9 +1854,51 @@ local function buildESP(ch,isNPC)
     }
 end
 
+-- Box ESP uses native ScreenGui Frames rather than executor Drawing objects.
+-- The 12 line Frames preserve the original 3D wireframe appearance.
+local ESP_BOX_EDGES = {
+    {1,2},{2,3},{3,4},{4,1},
+    {5,6},{6,7},{7,8},{8,5},
+    {1,5},{2,6},{3,7},{4,8}
+}
+function FX.releaseESPBoxLines(entry)
+    if not entry or not entry.boxLines then return end
+    for _,line in ipairs(entry.boxLines) do
+        if line then pcall(function() line:Destroy() end) end
+    end
+    entry.boxLines={}
+end
+function FX.ensureESPBoxLines(entry)
+    if #entry.boxLines==12 then
+        for _,line in ipairs(entry.boxLines) do
+            if not line.Parent then FX.releaseESPBoxLines(entry); break end
+        end
+        if #entry.boxLines==12 then return true end
+    end
+    FX.releaseESPBoxLines(entry)
+    if not FovGui or not FovGui.Parent then return false end
+    for i=1,12 do
+        local line=Instance.new("Frame")
+        line.Name="ESPBoxEdge_"..i
+        line.AnchorPoint=Vector2.new(0.5,0.5)
+        line.BackgroundColor3=ST.boxCol
+        line.BackgroundTransparency=0
+        line.BorderSizePixel=0
+        line.Size=UDim2.fromOffset(0,2)
+        line.Visible=false
+        line.ZIndex=10
+        line.Parent=FovGui
+        entry.boxLines[i]=line
+    end
+    return true
+end
 local function destroyESP(i)
-    local e=ST.espEntries[i]
-    if e then pcall(function() if e.holder then e.holder:Destroy() end; if e.boxLines then for _,line in ipairs(e.boxLines) do line:Remove() end end end) end
+    local entry=ST.espEntries[i]
+    if entry then
+        FX.espByCharacter[entry.ch]=nil
+        if entry.holder then pcall(function() entry.holder:Destroy() end) end
+        FX.releaseESPBoxLines(entry)
+    end
     table.remove(ST.espEntries,i)
 end
 
@@ -1686,6 +1910,12 @@ local function applyESP(e,myR)
         pcall(function() e.bb.Adornee=newRoot; e.hpBB_L.Adornee=newRoot; e.hpBB_T.Adornee=newRoot end)
     end
     if not e.hum or not e.hum.Parent then e.hum=findHuman(e.ch) end
+    if not myR then
+        e.bb.Enabled=false; e.hpBB_L.Enabled=false; e.hpBB_T.Enabled=false
+        for _,line in ipairs(e.boxLines) do line.Visible=false end
+        if e.highlight then e.highlight.Enabled=false end
+        return
+    end
     local dist=999999
     if myR and e.r and e.r.Parent then
         local ok,d=pcall(function() return (e.r.Position-myR.Position).Magnitude end)
@@ -1753,242 +1983,147 @@ local function applyESP(e,myR)
     if sH then
         local cur,max=getHPUniversal(e.ch,e.hum)
         local ratio=cur/max
-        if math.abs((e.lR or -1)-ratio)>0.005 then
+        if math.abs((e.lR or -1)-ratio)>0.005 or e.lastHpColL~=ST.hpColL or e.lastHpColT~=ST.hpColT then
             e.lR=ratio
+            e.lastHpColL=ST.hpColL; e.lastHpColT=ST.hpColT
             e.hpFill_L.Size=UDim2.new(1,0,ratio,0)
             e.hpFill_T.Size=UDim2.new(ratio,0,1,0)
-            local r2=math.floor(math.clamp(2*(1-ratio),0,1)*255)
-            local g2=math.floor(math.clamp(2*ratio,0,1)*255)
-            local hpColor=Color3.fromRGB(r2,g2,0)
-            e.hpFill_L.BackgroundColor3=hpColor; e.hpFill_T.BackgroundColor3=hpColor
+            local lowColor=Color3.fromRGB(255,30,30)
+            e.hpFill_L.BackgroundColor3=ST.hpColL:Lerp(lowColor,1-ratio)
+            e.hpFill_T.BackgroundColor3=ST.hpColT:Lerp(lowColor,1-ratio)
         end
     end
     local sB=S.box and not mate
-    
-    if sB and e.boxLines and #e.boxLines==12 and e.r and e.r.Parent then
+    if sB and e.r and e.r.Parent and FX.ensureESPBoxLines(e) then
         local cam=workspace.CurrentCamera
-        local rootPos=e.r.Position
-                local size=Vector3.new(2,3,2)
-        local corners={
-            rootPos+Vector3.new(-size.X/2,size.Y/2,-size.Z/2),
-            rootPos+Vector3.new(size.X/2,size.Y/2,-size.Z/2),
-            rootPos+Vector3.new(size.X/2,size.Y/2,size.Z/2),
-            rootPos+Vector3.new(-size.X/2,size.Y/2,size.Z/2),
-            rootPos+Vector3.new(-size.X/2,-size.Y/2,-size.Z/2),
-            rootPos+Vector3.new(size.X/2,-size.Y/2,-size.Z/2),
-            rootPos+Vector3.new(size.X/2,-size.Y/2,size.Z/2),
-            rootPos+Vector3.new(-size.X/2,-size.Y/2,size.Z/2)
-        }
-        local screenCorners={}
-        local onScreenCount=0
-        for i,corner in ipairs(corners) do
-            local screenPos,onScreen,depth=cam:WorldToViewportPoint(corner)
-            screenCorners[i]=Vector2.new(screenPos.X,screenPos.Y)
-            if onScreen then onScreenCount=onScreenCount+1 end
-        end
-        if onScreenCount>=1 then
-            local edges={{1,2},{2,3},{3,4},{4,1},{5,6},{6,7},{7,8},{8,5},{1,5},{2,6},{3,7},{4,8}}
-            for i,edge in ipairs(edges) do
-                e.boxLines[i].From=screenCorners[edge[1]]
-                e.boxLines[i].To=screenCorners[edge[2]]
-                e.boxLines[i].Color=ST.boxCol
-                e.boxLines[i].Visible=true
-            end
-        else
+        if not cam then
             for _,line in ipairs(e.boxLines) do line.Visible=false end
+            return
         end
-    elseif e.boxLines then
-        for _,line in ipairs(e.boxLines) do line.Visible=false end
+
+        -- GetBoundingBox honors the character's rotation and real part bounds.
+        -- Fall back to the root part if an unusual model has no usable bounds.
+        local boxCF,boxSize
+        local ok=pcall(function() boxCF,boxSize=e.ch:GetBoundingBox() end)
+        if not ok or not boxCF or not boxSize or boxSize.Magnitude<0.1 then
+            boxCF=e.r.CFrame
+            boxSize=Vector3.new(2,5,2)
+        end
+        local half=boxSize*0.5
+        local offsets={
+            Vector3.new(-half.X, half.Y,-half.Z),
+            Vector3.new( half.X, half.Y,-half.Z),
+            Vector3.new( half.X, half.Y, half.Z),
+            Vector3.new(-half.X, half.Y, half.Z),
+            Vector3.new(-half.X,-half.Y,-half.Z),
+            Vector3.new( half.X,-half.Y,-half.Z),
+            Vector3.new( half.X,-half.Y, half.Z),
+            Vector3.new(-half.X,-half.Y, half.Z)
+        }
+        local screen,front={},{}
+        local minX,maxX,minY,maxY=math.huge,-math.huge,math.huge,-math.huge
+        for i=1,8 do
+            local pos=cam:WorldToViewportPoint(boxCF:PointToWorldSpace(offsets[i]))
+            screen[i]=Vector2.new(pos.X,pos.Y)
+            front[i]=pos.Z>0.05
+            if front[i] then
+                minX=math.min(minX,pos.X); maxX=math.max(maxX,pos.X)
+                minY=math.min(minY,pos.Y); maxY=math.max(maxY,pos.Y)
+            end
+        end
+        local view=cam.ViewportSize
+        local intersects=(minX<view.X and maxX>0 and minY<view.Y and maxY>0)
+        for i,edge in ipairs(ESP_BOX_EDGES) do
+            local line=e.boxLines[i]
+            local a,b=edge[1],edge[2]
+            if intersects and front[a] and front[b] then
+                local diff=screen[b]-screen[a]
+                local len=diff.Magnitude
+                if len>0.5 and len<view.Magnitude*4 then
+                    line.BackgroundColor3=ST.boxCol
+                    local midpoint=(screen[a]+screen[b])*0.5
+                    line.Position=UDim2.fromOffset(midpoint.X,midpoint.Y)
+                    line.Size=UDim2.fromOffset(len,2)
+                    line.Rotation=math.deg(math.atan2(diff.Y,diff.X))
+                    line.Visible=true
+                else
+                    line.Visible=false
+                end
+            else
+                line.Visible=false
+            end
+        end
+    elseif e.boxLines and #e.boxLines>0 then
+        if not S.box then FX.releaseESPBoxLines(e)
+        else for _,line in ipairs(e.boxLines) do line.Visible=false end end
     end
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 end
 
+FX.espPlayerLastScan=0
 local function ensureESPLoop()
     if ST.espConn then return end
-    ST.espConn=RunService.Heartbeat:Connect(function()
-        pcall(function()
+    FX.espElapsed=0
+    ST.espConn=RunService.Heartbeat:Connect(function(dt)
+        FX.espElapsed+=dt
+        if FX.espElapsed<1/30 then return end
+        FX.espElapsed=0
+        local ok,err=pcall(function()
             frameCount+=1
-            local myR; pcall(function() local c=LocalPlayer.Character; myR=c and c:FindFirstChild("HumanoidRootPart") end)
-            if wantsESP() then
-                for _,p in pairs(Players:GetPlayers()) do
-                    if p~=LocalPlayer then
-                        local pChar=p.Character
-                        if pChar then
-                            local found=false
-                            for _,e in pairs(ST.espEntries) do if e.ch==pChar then found=true; break end end
-                            if not found then
-                                local root=findRoot(pChar)
-                                if root then
-                                    local ok,entry=pcall(buildESP,pChar,false)
-                                    if ok and entry then table.insert(ST.espEntries,entry) end
-                                end
-                            end
-                        end
-                        if not p.Character then
-                            for i=#ST.espEntries,1,-1 do if ST.espEntries[i].plr==p then destroyESP(i) end end
-                        end
+            local now=os.clock()
+            local ch=LocalPlayer.Character
+            local myRoot=ch and ch:FindFirstChild("HumanoidRootPart")
+            if wantsESP() and now-FX.espPlayerLastScan>=0.35 then
+                FX.espPlayerLastScan=now
+                for _,player in ipairs(Players:GetPlayers()) do
+                    if player~=LocalPlayer and player.Character and not FX.espByCharacter[player.Character] then
+                        local okBuild,entry=pcall(buildESP,player.Character,false)
+                        if okBuild and entry then
+                            table.insert(ST.espEntries,entry)
+                            FX.espByCharacter[entry.ch]=entry
+                        elseif not okBuild then FX.reportError("ESPBuild",entry) end
                     end
                 end
             end
-            if S.npc and os.clock()-ST.lastNpcScan>2 then
-                ST.lastNpcScan=os.clock()
-                for _,d in pairs(workspace:GetDescendants()) do
-                    if d:IsA("Model") and not d:GetAttribute("ForumXChamsProxy") and not isPlayerChar(d) then
-                        local h=d:FindFirstChildOfClass("Humanoid"); local r=findRoot(d)
-                        if h and r then
-                            local found=false
-                            for _,e in pairs(ST.espEntries) do if e.ch==d then found=true; break end end
-                            if not found then local ok,entry=pcall(buildESP,d,true); if ok and entry then table.insert(ST.espEntries,entry) end end
-                        end
+            if S.npc then
+                for npc in pairs(FX.npcKnown) do
+                    if not npc.Parent then
+                        FX.npcKnown[npc]=nil
+                    elseif not isPlayerChar(npc) and not FX.espByCharacter[npc] then
+                        local okBuild,entry=pcall(buildESP,npc,true)
+                        if okBuild and entry then
+                            table.insert(ST.espEntries,entry)
+                            FX.espByCharacter[entry.ch]=entry
+                        elseif not okBuild then FX.reportError("NPCBuild",entry) end
                     end
                 end
             end
             for i=#ST.espEntries,1,-1 do
-                local e=ST.espEntries[i]
-                local valid=e.ch and e.ch.Parent and e.holder and e.holder.Parent and e.r and e.r.Parent and (e.isNPC or (e.plr and e.plr.Character==e.ch))
-                if not valid then destroyESP(i)
-                elseif e.isNPC and not S.npc then destroyESP(i)
-                elseif not e.isNPC and not wantsESP() then
+                local entry=ST.espEntries[i]
+                local valid=entry.ch and entry.ch.Parent and entry.holder and entry.holder.Parent
+                    and entry.r and entry.r.Parent
+                    and (entry.isNPC or (entry.plr and entry.plr.Character==entry.ch))
+                if not valid or (entry.isNPC and not S.npc) or (not entry.isNPC and not wantsESP()) then
                     destroyESP(i)
-                else
-                    if not e.isNPC or frameCount%3==0 then pcall(applyESP,e,myR) end
+                elseif not entry.isNPC or frameCount%3==0 then
+                    local okApply,applyErr=pcall(applyESP,entry,myRoot)
+                    if not okApply then FX.reportError("ESPRender",applyErr) end
                 end
             end
         end)
+        if not ok then FX.reportError("ESPLoop",err) end
     end)
 end
 
 local function onESPChange()
-    playerChams.start()
-    ensureESPLoop()
-    if S.npc then ST.lastNpcScan=0 end
-end
-
-local R15_BONES={
-    {"Head","UpperTorso"},{"UpperTorso","LowerTorso"},
-    {"UpperTorso","LeftUpperArm"},{"LeftUpperArm","LeftLowerArm"},{"LeftLowerArm","LeftHand"},
-    {"UpperTorso","RightUpperArm"},{"RightUpperArm","RightLowerArm"},{"RightLowerArm","RightHand"},
-    {"LowerTorso","LeftUpperLeg"},{"LeftUpperLeg","LeftLowerLeg"},{"LeftLowerLeg","LeftFoot"},
-    {"LowerTorso","RightUpperLeg"},{"RightUpperLeg","RightLowerLeg"},{"RightLowerLeg","RightFoot"},
-}
-local R6_BONES={
-    {"Head","Torso"},{"Torso","Left Arm"},{"Torso","Right Arm"},
-    {"Torso","Left Leg"},{"Torso","Right Leg"},
-}
-
-local function getSkelLine(i)
-    if not skelLinePool[i] then
-        local ok,l=pcall(function() return Drawing.new("Line") end)
-        if not ok or not l then return nil end
-        l.Thickness=1.5; l.Color=ST.skelCol; l.Transparency=0; l.Visible=false
-        skelLinePool[i]=l
+    FX.setNPCCacheEnabled(S.npc)
+    if S.chams then playerChams.start() else playerChams.clear() end
+    if wantsESP() or S.npc then
+        ensureESPLoop()
+    else
+        if ST.espConn then ST.espConn:Disconnect(); ST.espConn=nil end
+        for i=#ST.espEntries,1,-1 do destroyESP(i) end
     end
-    return skelLinePool[i]
 end
-
-local function resolveSkeletonBones(ch)
-    local resolved={}
-    local bones=nil
-    if ch:FindFirstChild("UpperTorso") then bones=R15_BONES
-    elseif ch:FindFirstChild("Torso") then bones=R6_BONES end
-    if not bones then return resolved end
-    for _,pair in ipairs(bones) do
-        local p0=ch:FindFirstChild(pair[1])
-        local p1=ch:FindFirstChild(pair[2])
-        if p0 and p1 and p0:IsA("BasePart") and p1:IsA("BasePart") then
-            table.insert(resolved,{p0,p1})
-        end
-    end
-    return resolved
-end
-
-local function addSkelTarget(ch)
-    for _,t in pairs(skelTargets) do if t.ch==ch then return end end
-    local r=findRoot(ch); if not r then return end
-    table.insert(skelTargets,{ch=ch,r=r,bones=resolveSkeletonBones(ch),lastScan=os.clock()})
-end
-
-local function startSkeletonLoop()
-    if skeletonConn then return end
-    skeletonConn=RunService.RenderStepped:Connect(function()
-        local idx=0
-        if not S.skeleton then
-            for i=1,#skelLinePool do skelLinePool[i].Visible=false end
-            return
-        end
-        local myR
-        pcall(function() local c=LocalPlayer.Character; myR=c and c:FindFirstChild("HumanoidRootPart") end)
-        for _,p in pairs(Players:GetPlayers()) do
-            if p~=LocalPlayer and p.Character then addSkelTarget(p.Character) end
-        end
-        if S.npc and os.clock()-ST.skelLastScan>1.5 then
-            ST.skelLastScan=os.clock()
-            for _,d in pairs(workspace:GetDescendants()) do
-                if d:IsA("Model") and not d:GetAttribute("ForumXChamsProxy") and not isPlayerChar(d) and d:FindFirstChildOfClass("Humanoid") and findRoot(d) then
-                    addSkelTarget(d)
-                end
-            end
-        end
-        local cam=workspace.CurrentCamera
-        for i=#skelTargets,1,-1 do
-            local t=skelTargets[i]
-            if not t.ch or not t.ch.Parent or not t.r or not t.r.Parent then
-                table.remove(skelTargets,i)
-            else
-                pcall(function()
-                    local inRange=true
-                    if myR then
-                        local ok,d=pcall(function() return (t.r.Position-myR.Position).Magnitude end)
-                        if ok and d>ST.espMax then inRange=false end
-                    end
-                    if inRange then
-                        if os.clock()-t.lastScan>2 then t.bones=resolveSkeletonBones(t.ch); t.lastScan=os.clock() end
-                        for _,pair in ipairs(t.bones) do
-                            local p0,p1=pair[1],pair[2]
-                            if p0 and p0.Parent and p1 and p1.Parent then
-                                local ok1,a,aOn=pcall(function() return cam:WorldToViewportPoint(p0.Position) end)
-                                local ok2,b,bOn=pcall(function() return cam:WorldToViewportPoint(p1.Position) end)
-                                if ok1 and ok2 and aOn and bOn and a.Z>0 and b.Z>0 then
-                                    idx+=1
-                                    local line=getSkelLine(idx)
-                                    if line then
-                                        line.Color=ST.skelCol
-                                        line.From=Vector2.new(a.X,a.Y)
-                                        line.To=Vector2.new(b.X,b.Y)
-                                        line.Visible=true
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end)
-            end
-        end
-        for i=idx+1,#skelLinePool do
-            if skelLinePool[i] then skelLinePool[i].Visible=false end
-        end
-    end)
-end
-
-startSkeletonLoop()
 
 local function loadPlayer()
     clearContent(); setActiveTab("player")
@@ -2094,7 +2229,7 @@ local function loadPlayer()
         end)
         local czVL=mkValLabel(R,(W/2)-VW-72,VW,ST.cameraFOVValue,70,120,function(v)
             ST.cameraFOVValue=v
-            if ST.cameraFOV then workspace.CurrentCamera.FieldOfView=v end
+            if ST.cameraFOV and workspace.CurrentCamera then workspace.CurrentCamera.FieldOfView=v end
             return v
         end)
     end
@@ -2748,7 +2883,11 @@ function Config.validate(doc)
     end
     assert(type(data.espFlags)=="table","Missing visual settings")
     result.espFlags={}
-    for _,k in ipairs(Config.flags) do assert(type(data.espFlags[k])=="boolean","Invalid visual toggle: "..k); result.espFlags[k]=data.espFlags[k] end
+    for _,k in ipairs(Config.flags) do
+        local flag=data.espFlags[k]
+        assert(type(flag)=="boolean","Invalid visual toggle: "..k)
+        result.espFlags[k]=flag
+    end
     assert(data.espFlags.healthBarMode=="top" or data.espFlags.healthBarMode=="left","Invalid health bar mode")
     result.espFlags.healthBarMode=data.espFlags.healthBarMode
     for _,k in ipairs({"whitelistPlayers","whitelistTeams"}) do
@@ -2773,7 +2912,9 @@ function Config.apply(data)
         else ST[k]=v end
     end
     for _,k in ipairs(Config.keys) do if ST[k]==false then ST[k]=nil end end
-    if ST.noclipEnabled then enableNoclip() end
+    local useNoclip=ST.noclipEnabled
+    ST.noclipEnabled=false -- The old state has already been disabled above.
+    if useNoclip then enableNoclip() end
     if ST.wsEnabled or ST.jumpEnabled then ensureSpeedLoop() end
     if ST.promptBypass then enablePromptBypass() end
     if ST.promptRange then enablePR() end
@@ -2859,7 +3000,8 @@ function Config.beginEdit(name)
     Config.selected=name
 end
 function Config.saveCurrent(name)
-    local target=Config.editing or name
+    local target=type(name)=="string" and name:match("^%s*(.-)%s*$") or ""
+    if target=="" then target=Config.editing end
     local path=Config.saveFile(target)
     target=path:match("([^/]+)%.json$")
     Config.editing=target; Config.selected=target
@@ -3045,15 +3187,15 @@ loadSettings=function()
     end)
     button(row,"Copy Path",-86,76,function()
         assert(type(setclipboard)=="function","Clipboard unavailable")
-        setclipboard("C:/Users/TECHORA/AppData/Local/Wave/workspace/ForumX_Configs")
-        return "Folder path copied"
+        setclipboard(Config.folder)
+        return "Relative config folder copied"
     end)
     local ok,message=pcall(refresh)
     if not ok then report(false,message) end
     local timer,lastNames=0,""
     table.insert(ST.plConns,RunService.Heartbeat:Connect(function(dt)
         timer+=dt
-        if timer<1 then return end
+        if timer<5 then return end
         timer=0
         local scanOK,names=pcall(Config.fileNames)
         if scanOK then
@@ -3079,23 +3221,26 @@ do
 end
 
 local function killAll()
+    if not G.ForumX_Running then return end
+    G.ForumX_Running=false
     playerChams.clear()
-    G.ForumX_Running=false; cancelKeybindCapture(); clearSliders(); closePicker()
+    cancelKeybindCapture(); clearSliders(); closePicker()
     if ST.noclipEnabled then disableNoclip() end
     ST.wsEnabled=false; ST.jumpEnabled=false
     stopSpeedLoop(); restoreSpeeds()
     stopCFTPLoop()
     disablePromptBypass(); disablePR(); disableAntiAfk()
-    disableAutoInteract(); disableNearFling(); stopSpectate(); disableAimbot()
+    disableAutoInteract(); disableNearFling(); stopSpectate(); disableAimbot(); disableCameraFOV()
     ST.v1Targets={}
     for _,c in pairs(ST.plConns) do pcall(function() c:Disconnect() end) end
     for k in pairs(S) do if type(S[k])=="boolean" then S[k]=false end end
     for i=#ST.espEntries,1,-1 do destroyESP(i) end
-    ST.espEntries={}; skelTargets={}
+    ST.espEntries={}
+    table.clear(FX.espByCharacter)
+    FX.setNPCCacheEnabled(false)
+    for _,conn in ipairs(FX.extraConnections) do pcall(function() conn:Disconnect() end) end
+    table.clear(FX.extraConnections)
     if ST.espConn then ST.espConn:Disconnect(); ST.espConn=nil end
-    if skeletonConn then skeletonConn:Disconnect(); skeletonConn=nil end
-    for _,l in pairs(skelLinePool) do pcall(function() l:Remove() end) end
-    G.ForumX_Drawings=nil
     if inputConn then inputConn:Disconnect() end
     if inputEndedConn then inputEndedConn:Disconnect() end
     if charConn then charConn:Disconnect() end
@@ -3105,6 +3250,7 @@ local function killAll()
         if d:IsA("Folder") and (d.Name=="ForumXESP" or d.Name==FOLDER) then pcall(function() d:Destroy() end) end
     end
     FovGui:Destroy(); ScreenGui:Destroy(); G.ForumX_Kill=nil
+    -- Preserve ForumX_Errors for inspection until the next launch.
 end
 G.ForumX_Kill=killAll
 CloseBtn.MouseButton1Click:Connect(killAll)
@@ -3118,7 +3264,10 @@ MinBtn.MouseButton1Click:Connect(function()
         MinBtn.Text="+"
     else
         TweenService:Create(MainFrame,TweenInfo.new(0.25,Enum.EasingStyle.Quart),{Size=UDim2.new(0,MENU_W,0,MENU_H)}):Play()
-        task.delay(0.25,function() BodyFrame.Visible=true end); MinBtn.Text="-"
+        task.delay(0.25,function()
+            if G.ForumX_Running and not minimized and BodyFrame.Parent then BodyFrame.Visible=true end
+        end)
+        MinBtn.Text="-"
     end
 end)
 
@@ -3143,7 +3292,7 @@ inputConn=UserInputService.InputBegan:Connect(function(input,gameProcessed)
             return
         end
         local tgt,btn2,onSet2=keyTarget,keyBtn,keyOnSet
-        waitKey=false; keyTarget=nil; keyBtn=nil; keyOnSet=nil
+        waitKey=false; keyTarget=nil; keyBtn=nil; keyOnSet=nil; FX.capturePreviousLabel=nil
         if keyTimeout then pcall(task.cancel,keyTimeout); keyTimeout=nil end
         if onSet2 then onSet2(kb) end
         if btn2 then btn2.Text=keybindLabel(kb); TweenService:Create(btn2,TweenInfo.new(0.15),{BackgroundTransparency=0.82}):Play() end
@@ -3159,7 +3308,6 @@ inputConn=UserInputService.InputBegan:Connect(function(input,gameProcessed)
     if input.UserInputType==Enum.UserInputType.Keyboard then
         local kc=input.KeyCode
         if ST.menuKey and ST.menuKey.type=="key" and kc==ST.menuKey.keyCode then MainFrame.Visible=not MainFrame.Visible; return end
-        if kc==Enum.KeyCode.Insert and (not ST.menuKey or ST.menuKey.type~="key" or ST.menuKey.keyCode~=Enum.KeyCode.Insert) then MainFrame.Visible=not MainFrame.Visible; return end
         if ST.noclipKey and ST.noclipKey.type=="key" and kc==ST.noclipKey.keyCode then toggleNoclip(); return end
         if ST.cfTpKey and ST.cfTpKey.type=="key" and kc==ST.cfTpKey.keyCode then startCFTPLoop(); return end
         if ST.nearFlingKey and ST.nearFlingKey.type=="key" and kc==ST.nearFlingKey.keyCode then toggleNearFling(); return end
@@ -3171,6 +3319,10 @@ inputConn=UserInputService.InputBegan:Connect(function(input,gameProcessed)
     end
     aimbotKeyPressed(input)
 end)
+FX.trackConnection(UserInputService.WindowFocusReleased:Connect(function()
+    stopCFTPLoop()
+    if ST.aimbotMode=="Hold" then ST.aimbotActive=false; aimbotLastTarget=nil end
+end))
 inputEndedConn=UserInputService.InputEnded:Connect(function(input)
     aimbotKeyReleased(input)
     
@@ -3183,12 +3335,11 @@ inputEndedConn=UserInputService.InputEnded:Connect(function(input)
 end)
 
 
-charConn=LocalPlayer.CharacterAdded:Connect(function()
+charConn=LocalPlayer.CharacterAdded:Connect(function(character)
     task.wait(0.5)
-    if not G.ForumX_Running then return end
+    if not G.ForumX_Running or LocalPlayer.Character~=character then return end
     ST.savedWS=nil; ST.savedJP=nil; ST.savedJH=nil; ST.savedUJP=nil
     spoofedHumanoid=nil; spoofActive_flag=false
-    skelTargets={}
     if ST.noclipEnabled then enableNoclip() end
     if ST.wsEnabled or ST.jumpEnabled then
         stopSpeedLoop()
@@ -3197,10 +3348,9 @@ charConn=LocalPlayer.CharacterAdded:Connect(function()
     if ST.autoInteract then
         disableAutoInteract()
         task.wait(0.2)
-        if not G.ForumX_Running then return end
+        if not G.ForumX_Running or not ST.autoInteract then return end
         enableAutoInteract()
     end
 end)
 
 loadPlayer()
-
